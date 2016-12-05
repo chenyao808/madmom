@@ -61,7 +61,8 @@ class BeatStateSpace(object):
 
     """
 
-    def __init__(self, min_interval, max_interval, num_intervals=None):
+    def __init__(self, min_interval, max_interval, num_intervals=None,
+                 online=False, silence=False):
         # per default, use a linear spacing of the tempi
         intervals = np.arange(np.round(min_interval),
                               np.round(max_interval) + 1)
@@ -88,6 +89,10 @@ class BeatStateSpace(object):
         first_states = np.cumsum(np.r_[0, self.intervals[:-1]])
         self.first_states = first_states.astype(np.uint32)
         self.last_states = np.cumsum(self.intervals).astype(np.uint32) - 1
+        self.num_positions = self.last_states - self.first_states + 1
+        if silence:
+            self.silence_state = self.num_states
+            self.num_states += 1
         # define the positions and intervals of the states
         self.state_positions = np.empty(self.num_states)
         self.state_intervals = np.empty(self.num_states, dtype=np.uint32)
@@ -98,6 +103,70 @@ class BeatStateSpace(object):
                                                              endpoint=False)
             self.state_intervals[idx: idx + i] = i
             idx += i
+        if silence:
+            self.first_states = np.hstack((self.first_states,
+                                           self.silence_state))
+            self.last_states = np.hstack((self.last_states,
+                                          self.silence_state))
+            # use interval = 1 for silence, needed in transition model
+            self.state_intervals[self.silence_state] = 1
+            # use position = 0.5 (non-beat), needed in observation model
+            self.state_positions[self.silence_state] = 0.5
+        else:
+            self.silence_state = None
+        if online:
+            self.neighbors = self.compute_neighbors()
+
+    def compute_neighbors(self):
+        # assign a non valid state number to impossible transitions
+        not_valid_id = np.iinfo(np.uint16).max
+        neighbors = np.ones((self.num_states, 7), dtype=np.uint16) * \
+            not_valid_id
+        for ii, i in enumerate(self.intervals):
+            # all states with interval i
+            s = np.where(self.state_intervals == i)[0]
+            if i > 1:
+                # constant interval, position + 1
+                neighbors[s, 0] = np.hstack((s[1:], s[0]))
+                # constant interval, position - 1
+                if i > 2:
+                    neighbors[s, 1] = np.hstack((s[-1], s[:-1]))
+            # interval + 1
+            if ii < self.num_intervals - 1:
+                # for each state of the current tempo find the corresponding
+                # state of the faster tempo
+                factor = float(self.num_positions[ii + 1]) / \
+                    float(self.num_positions[ii])
+                s_new = (np.arange(self.num_positions[ii], dtype=float) + 1
+                         ) / factor
+                # position - 1
+                s_new_left = np.floor(s_new)
+                neighbors[s, 2] = s_new_left + self.first_states[ii + 1]
+                # position + 1
+                s_new_right = np.ceil(s_new)
+                neighbors[s, 3] = s_new_right + self.first_states[ii + 1]
+            # interval - 1
+            if ii > 0:
+                # for each state of the current tempo find the corresponding
+                # state of the slower tempo
+                factor = float(self.num_positions[ii]) / \
+                         float(self.num_positions[ii - 1])
+                s_new = (np.arange(self.num_positions[ii], dtype=float)
+                         ) / factor
+                # position - 1
+                s_new_left = np.floor(s_new)
+                neighbors[s, 4] = s_new_left + self.first_states[ii - 1]
+                # position + 1
+                s_new_right = np.ceil(s_new)
+                if i > 2:
+                    # the first state is covered above already
+                    s_new_right[s_new_right == 0] = not_valid_id - \
+                                                    self.first_states[ii - 1]
+                    neighbors[s, 5] = s_new_right + self.first_states[
+                                ii - 1]
+            # add the center state
+            neighbors[s, 6] = s
+        return neighbors
 
 
 class BarStateSpace(object):
@@ -288,7 +357,7 @@ class BeatTransitionModel(TransitionModel):
 
     """
 
-    def __init__(self, state_space, transition_lambda):
+    def __init__(self, state_space, transition_lambda, silence_probs=None):
         # save attributes
         self.state_space = state_space
         self.transition_lambda = float(transition_lambda)
@@ -296,6 +365,7 @@ class BeatTransitionModel(TransitionModel):
         # Note: use all states, but remove all first states because there are
         #       no same tempo transitions into them
         states = np.arange(state_space.num_states, dtype=np.uint32)
+        # Return only those states which are not first_states.
         states = np.setdiff1d(states, state_space.first_states)
         prev_states = states - 1
         probabilities = np.ones_like(states, dtype=np.float)
@@ -308,6 +378,16 @@ class BeatTransitionModel(TransitionModel):
         from_int = state_space.state_intervals[from_states].astype(np.float)
         to_int = state_space.state_intervals[to_states].astype(np.float)
         prob = exponential_transition(from_int, to_int, self.transition_lambda)
+        if state_space.silence_state is not None:
+            # add transitions from silence state
+            prob[-1, :] = silence_probs[0]
+            # add transitions to silence state
+            prob[:, -1] = silence_probs[1]
+            # add self transition
+            prob[-1, -1] = 1 - silence_probs[0]
+            # normalize the transition probabilities
+            prob /= np.sum(prob, axis=1)[:, np.newaxis]
+
         # use only the states with transitions to/from != 0
         from_prob, to_prob = np.nonzero(prob)
         states = np.hstack((states, to_states[to_prob]))

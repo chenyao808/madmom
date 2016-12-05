@@ -48,20 +48,28 @@ class RNNBeatProcessor(SequentialProcessor):
 
     """
 
-    def __init__(self, post_processor=average_predictions, **kwargs):
+    def __init__(self, post_processor=average_predictions,
+                 online=False, model_paths=None, **kwargs):
         # pylint: disable=unused-argument
         from ..audio.signal import SignalProcessor, FramedSignalProcessor
         from ..audio.spectrogram import (
             FilteredSpectrogramProcessor, LogarithmicSpectrogramProcessor,
             SpectrogramDifferenceProcessor)
         from ..ml.nn import NeuralNetworkEnsemble
-        from ..models import BEATS_BLSTM
+        if online:
+            if model_paths is None:
+                raise ValueError('Please provide online RNN models!\n')
+            frame_sizes = [2028]
+        else:
+            from ..models import BEATS_BLSTM
+            model_paths = BEATS_BLSTM
+            frame_sizes = [1024, 2048, 4096]
 
         # define pre-processing chain
         sig = SignalProcessor(num_channels=1, sample_rate=44100)
         # process the multi-resolution spec & diff in parallel
         multi = ParallelProcessor([])
-        for frame_size in [1024, 2048, 4096]:
+        for frame_size in frame_sizes:
             frames = FramedSignalProcessor(frame_size=frame_size, fps=100)
             filt = FilteredSpectrogramProcessor(
                 num_bands=6, fmin=30, fmax=17000, norm_filters=True)
@@ -75,7 +83,7 @@ class RNNBeatProcessor(SequentialProcessor):
 
         # process the pre-processed signal with a NN ensemble and the given
         # post_processor
-        nn = NeuralNetworkEnsemble.load(BEATS_BLSTM,
+        nn = NeuralNetworkEnsemble.load(model_paths,
                                         ensemble_fn=post_processor, **kwargs)
 
         # instantiate a SequentialProcessor
@@ -921,11 +929,13 @@ class DBNBeatTrackingProcessor(Processor):
     OBSERVATION_LAMBDA = 16
     THRESHOLD = 0
     CORRECT = True
+    SILENCE = False
 
     def __init__(self, min_bpm=MIN_BPM, max_bpm=MAX_BPM, num_tempi=NUM_TEMPI,
                  transition_lambda=TRANSITION_LAMBDA,
                  observation_lambda=OBSERVATION_LAMBDA, correct=CORRECT,
-                 threshold=THRESHOLD, fps=None, **kwargs):
+                 threshold=THRESHOLD, fps=None, online=False, silence=SILENCE,
+                 from_silence=0, to_silence=0, **kwargs):
         # pylint: disable=unused-argument
         # pylint: disable=no-name-in-module
         from .beats_hmm import (BeatStateSpace as St,
@@ -936,13 +946,15 @@ class DBNBeatTrackingProcessor(Processor):
         # convert timing information to construct a beat state space
         min_interval = 60. * fps / max_bpm
         max_interval = 60. * fps / min_bpm
-        self.st = St(min_interval, max_interval, num_tempi)
+        self.st = St(min_interval, max_interval, num_tempi, online=online,
+                     silence=silence)
         # transition model
-        self.tm = Tm(self.st, transition_lambda)
+        self.tm = Tm(self.st, transition_lambda, silence_probs=(from_silence,
+                                                                to_silence))
         # observation model
         self.om = Om(self.st, observation_lambda)
         # instantiate a HMM
-        self.hmm = Hmm(self.tm, self.om, None)
+        self.hmm = Hmm(self.tm, self.om, initial_distribution=None)
         # save variables
         self.correct = correct
         self.threshold = threshold
@@ -1016,7 +1028,7 @@ class DBNBeatTrackingProcessor(Processor):
     def add_arguments(parser, min_bpm=MIN_BPM, max_bpm=MAX_BPM,
                       num_tempi=NUM_TEMPI, transition_lambda=TRANSITION_LAMBDA,
                       observation_lambda=OBSERVATION_LAMBDA,
-                      threshold=THRESHOLD, correct=CORRECT):
+                      threshold=THRESHOLD, correct=CORRECT, silence=SILENCE):
         """
         Add DBN related arguments to an existing parser object.
 
@@ -1070,6 +1082,15 @@ class DBNBeatTrackingProcessor(Processor):
                             'higher values prefer a constant tempo over a '
                             'tempo change from one beat to the next one '
                             '[default=%(default).1f]')
+        g.add_argument('--silence', dest='silence', action='store_true',
+                       default=silence, help='Use silence state '
+                       '[default=%(default)s]')
+        g.add_argument('--to_silence', action='store', type=float,
+                       default=1e-5, help='Probability of entering the '
+                       'silence state [default=%(default).6f]')
+        g.add_argument('--from_silence', action='store', type=float,
+                       default=1e-4, help='Probability of leaving the '
+                       'silence state [default=%(default).6f]')
         # observation model stuff
         g.add_argument('--observation_lambda', action='store', type=float,
                        default=observation_lambda,
@@ -1095,6 +1116,119 @@ class DBNBeatTrackingProcessor(Processor):
                                 'function)')
         # return the argument group so it can be modified if needed
         return g
+
+
+class OnlineDBNBeatTrackingProcessor(DBNBeatTrackingProcessor):
+    """
+    Beat tracking with RNNs and a dynamic Bayesian network (DBN) approximated
+    by a Hidden Markov Model (HMM). This is the online version of the offline
+    DBNBeatTrackingProcessor.
+
+    Parameters
+    ----------
+    debug : bool, optional
+        Save debugging info to file
+    reset_interval_sec : int, optional
+        Set the state which is reported to the global maximum every
+        reset_interval_sec seconds. If it is set to zero, this is executed
+        for every frame.
+
+    Notes
+    -----
+    Instead of the originally proposed state space and transition model for
+    the DBN [1]_, the more efficient version proposed in [2]_ is used.
+
+    """
+
+    def __init__(self, debug=False, reset_interval_sec=5, **kwargs):
+        # call base class
+        super(OnlineDBNBeatTrackingProcessor, self).__init__(
+            online=True, **kwargs)
+        self.debug = debug
+        # convert seconds to frames
+        self.reset_interval = max([1, np.round(reset_interval_sec * self.fps)])
+        # duration of the burn-in period at the beginning
+        self.burn_in_frames = np.round(3. * self.fps)
+
+    def process(self, activations):
+        """
+        Detect the beats in the given activation function.
+
+        Parameters
+        ----------
+        activations : numpy array
+            Beat activation function.
+
+        Returns
+        -------
+        beats : numpy array
+            Detected beat positions [seconds].
+
+        """
+        # Get transitions of transition model (This could be done easier
+        # with the make_dense method of the TransitionModel of the BarTracker
+        # branch)
+        from scipy.sparse import csr_matrix
+        transitions = csr_matrix((self.hmm.transition_model.probabilities,
+                                  self.hmm.transition_model.states,
+                                  self.hmm.transition_model.pointers))
+        states, prev_states = transitions.nonzero()
+        # set up generator for forward algorithm
+        fwd = self.hmm.forward_generator(activations)
+        path = np.zeros((activations.shape[0]), dtype=int)
+        if self.debug:
+            fwd_mat = np.zeros((activations.shape[0], self.st.num_states))
+        else:
+            fwd_mat = None
+        # loop over frames
+        for i, f in enumerate(fwd):
+            if i < self.burn_in_frames or i % self.reset_interval == 0:
+                # use the global maximum of f at the beginning and every
+                # reset_interval frames
+                path[i] = np.argmax(f)
+            else:
+                path[i] = self.post_process(f, states, prev_states, path[i-1])
+            if self.debug:
+                fwd_mat[i, :] = f
+
+        if self.debug:
+            # convert intervals to bpm
+            bpms = 60. * self.fps / self.st.state_intervals
+            npz = {'fwd': fwd, 'positions': self.st.state_positions,
+                   'intervals': bpms, 'path': path,
+                   'fps': self.fps}
+            np.savez('/tmp/debug_info_OnlineDBNBeatTracker.npz', **npz)
+        # just take the frames with the smallest beat state values
+        from scipy.signal import argrelmin
+        beats = argrelmin(self.st.state_positions[path], mode='wrap')[0]
+        # recheck if they are within the "beat range", i.e. the pointers
+        # of the observation model for that state must be 1
+        # Note: interpolation and alignment of the beats to be at state 0
+        #       does not improve results over this simple method
+        beats = beats[self.om.pointers[path[beats]] == 1]
+        # remove beats that are closer together than 100 ms
+        threshold = np.round(0.1 * self.fps)
+        b = list([beats[0]])
+        for i in range(1, len(beats)):
+            if (beats[i] - b[-1]) > threshold:
+                b.append(beats[i])
+        return np.array(b) / float(self.fps)
+
+    def post_process(self, f, states, prev_states, curr_state,
+                     use_neighbor_states=True):
+        # get possible successor states of last best_state
+        next_states = states[prev_states == curr_state]
+        # add neighbor states
+        if use_neighbor_states:
+            neighbors = self.st.neighbors[next_states, :]
+            # remove invalid states
+            neighbors = neighbors[neighbors < self.st.num_states]
+        else:
+            # do not use extended transition model
+            neighbors = next_states
+        # chose best among these neighbor states
+        best_neighbor = np.argmax(f[neighbors])
+        return neighbors[best_neighbor]
 
 
 class DBNDownBeatTrackingProcessor(Processor):
