@@ -605,6 +605,7 @@ class HiddenMarkovModel(object):
                                           tm_pointers[state + 1]):
                     fwd[cur, state] += fwd[prev, tm_states[prev_pointer]] * \
                                        tm_probabilities[prev_pointer]
+
                 # multiply with the observation probability
                 fwd[cur, state] *= om_densities[frame, om_pointers[state]]
                 prob_sum += fwd[cur, state]
