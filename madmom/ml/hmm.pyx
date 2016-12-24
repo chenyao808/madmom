@@ -394,6 +394,9 @@ class HiddenMarkovModel(object):
             raise ValueError('Initial distribution is not a probability '
                              'distribution.')
         self.initial_distribution = initial_distribution
+        # FIXME: this works only for online mode (frame-by-frame)
+        self.fwd = np.zeros((2, transition_model.num_states), dtype=np.float)
+        self.fwd[0, :] = self.initial_distribution
 
     @cython.cdivision(True)
     @cython.boundscheck(False)
@@ -530,19 +533,18 @@ class HiddenMarkovModel(object):
         cdef double [:, ::1] om_densities = om.densities(observations)
 
         # forward variables
-        cdef double[:, ::1] fwd = np.zeros((num_observations + 1, num_states),
-                                           dtype=np.float)
+        cdef double[:, ::1] fwd = self.fwd
         # define counters etc.
         cdef unsigned int prev_pointer, frame, state, cur, prev
         cdef double prob_sum, norm_factor
 
-        # init forward variables
-        if init is None:
-            for state in range(num_states):
-                fwd[0, state] = self.initial_distribution[state]
-        else:
-            for state in range(num_states):
-                fwd[0, state] = init[state]
+        # # init forward variables
+        # if init is None:
+        #     for state in range(num_states):
+        #         fwd[0, state] = self.initial_distribution[state]
+        # else:
+        #     for state in range(num_states):
+        #         fwd[0, state] = init[state]
 
         # iterate over all observations
         for frame in range(num_observations):

@@ -1032,7 +1032,8 @@ class DBNBeatTrackingProcessor(Processor):
             self.fwd_variables = None
         # forward HMM decoding
         fwd = self.hmm.forward(activations, init=self.fwd_variables)
-        self.fwd_variables = fwd.flatten()
+        # self.fwd_variables = fwd.flatten()
+        self.hmm.fwd[0, :] = fwd.flatten()
         # use simply the most probable state
         state = np.argmax(fwd)
         # decide if it is a beat
